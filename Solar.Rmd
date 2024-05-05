@@ -1,0 +1,358 @@
+---
+title: "STA 141B Solar"
+author: "Robert Baranic"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(plyr)
+library(janitor)
+library(tidyr)
+library(lubridate)
+library(stringr)
+library(ggplot2)
+library(gridExtra)
+```
+
+First, I listed all of the zip files in the working directory so that I could unzip them all at once to access all the files needed.
+```{r}
+zip = list.files(pattern = "\\.zip$") #https://stackoverflow.com/questions/4876813/using-r-to-list-all-files-with-a-specified-extension
+#list only files with .zip extension so we can unzip
+```
+
+```{r}
+lapply(zip, unzip) #unzip all zip files in directory
+```
+When all the files are unzipped, we can access all the files of a given type so we can apply our functions all at once. Here, we are working on the .wea files first.
+```{r}
+w = list.files(pattern = "\\.wea$")
+```
+
+```{r}
+w = lapply(w, readLines)
+```
+
+By readinng the head of the .wea files, we find a pattern immediately: the data starts at line 7, there are nno headers, and the are separated by white space.
+```{r}
+readLines("USA_CA_Fairfield-San.Francisco.Bay.Reserve.998011_TMYx.2007-2021.wea", n=10)
+```
+
+```{r}
+wea = readLines("USA_CA_Fairfield-San.Francisco.Bay.Reserve.998011_TMYx.2007-2021.wea")
+wea2 = wea[-1:-6]
+```
+
+To verify the data, we first check the basic characteristics: it is a dataframe with 5 variables and there are no NA values in the data. Upon visual inspection, the entries appear to be the same. A quick look at frequency tables for columns 1 and 2 show that the data is likely observations taken 24 times a day (once per hour), everyday. This is consistent with the frequencies observed.
+```{r}
+wea = read.table(textConnection(wea2))
+class(wea)
+dim(wea)
+any(is.na(wea))
+table(wea$V2)
+table(wea$V1)
+```
+
+Next, we perform the same process on the .pvsyst files in order to apply our read functions across all the data files at once.
+```{r}
+p = list.files(pattern = "\\.pvsyst$")
+```
+
+From looking at the head of the file, we can see the data starts at line 15 and our header is on line 13, so we extract line 13 and save it as a vector so we can use them in our read.table function. Class and dim report the same result as the .wea file which suggests it is also collected hourly. The table of day numbers also line up with the .wea file. There are also no NA values.
+```{r}
+lines = readLines("USA_CA_Fairfield-San.Francisco.Bay.Reserve.998011_TMYx.2007-2021.pvsyst")
+head(lines, n = 20)
+lines[13]
+strsplit(lines[13], split = ",")
+
+names = as.vector(strsplit(lines[13], split = ","))
+data = lines[15:length(lines)]
+pv = read.table(textConnection(data), sep = ",", col.names = names[[1]])
+class(pv)
+dim(pv)
+table(pv$Day)
+any(is.na(pv))
+```
+
+.stat:
+
+```{r}
+list.files(pattern = "\\.stat$")
+```
+
+```{r}
+ll = readLines("USA_CA_Fairfield-San.Francisco.Bay.Reserve.998011_TMYx.2007-2021.stat")
+```
+
+To make it simpler, I broke down the functions to read in the monthly data and the hourly data separately, but the processes are similar to begin with.
+#Monthly:
+First, we must find the start of each table. This is done with regular expressions, matching the start with the exact title, putting it into a vector. We verify this along the way by subsetting the lines with the vector and it outputs only the titles of the tables. We can also clearly see that the line numbers where they start are not the same and are some distance between each other.
+```{r}
+monthStart = c(grep("Monthly Statistics for Dry Bulb temperatures", ll, useBytes = T),
+               grep("Monthly Statistics for Dew Point temperatures", ll, useBytes = T), 
+               grep("Monthly Wind Direction", ll, useBytes = T), 
+               grep("Monthly Statistics for Wind Speed", ll, useBytes = T))
+monthStart
+ll[monthStart]
+```
+
+To find the end of the tables, we did another regular expression to match exactly to a few strings. By looking through the file, I noticed that each table was followed by either " - Monthly" or " - Average" which would be the start to another table, or it listed maximum and minimum values, so we also looked for " - Maximum". We passed this through a for loop since this was easier for me to visualize with the amount of conditional operations. We find the smallest line number in which any of those strings is greater than the line number for the start of the table, signifying the end of that table. By printing out the lines, I manually verified that these were the ends of the table.
+```{r}
+monthEnd = c()
+for (i in 1 : length(monthStart)) {
+  monthEnd = c(monthEnd, min(grep("- Monthly|- Average|- Maximum", ll, useBytes = T)[grep("- Monthly|- Average|- Maximum", ll, useBytes = T) > monthStart[i]]))
+  print(monthEnd) 
+}
+
+ll[monthEnd]
+```
+
+Now we can read in the data by using our start and end indices, separating at tabs. However, the start and end of lines also use tabs, so this will create two blank columns. We use remove_empty from janitor package to clear these columns since they contain no information. I manually verified the data from this process and observed some patterns. All the tables were in a similar format except for the monthly wind statistics, this will be addressed when the function is created.
+```{r}
+monthlyTables = ll[(monthStart[1] + 1): (monthEnd[1] -1)]
+monthlyTables = monthlyTables[monthlyTables != ""]
+monthlyTables
+
+df = read.table(textConnection(monthlyTables), header = T, sep = "\t")
+df = remove_empty(df)
+df
+```
+
+We must then transpose all the tables. The old row names are used as the column names, so we can now remove them from the data. I updated the names of column 2 and 4 so we do not have duplicate names, reducing errors while writing functions. Time was then converted to POSIXct for all the tables except for the wind table which did not contain any time information. A conditional if statement was implemented in the final function to avoid performing these operations on this table. Time was converted with the functions below and all the columns except for the time columns were converted to numerics.
+```{r}
+df = as.data.frame(t(df))
+colnames(df) <- as.character(df[1, ])
+df = df[-1, ]
+
+names(df)[2] <- "Maximum Time"
+names(df)[4] <- "Minimum Time"
+
+dateMax = sprintf("%s/%s/%s/%s", 2023, rownames(df), sapply(strsplit(df$`Maximum Time`, split = ":"), "[[", 1), sapply(strsplit(df$`Maximum Time`, split = ":"), "[[", 2))
+
+dateMaxPos = as.POSIXct(strptime(dateMax, "%Y/%b/%d/%H"))
+
+dateMin = sprintf("%s/%s/%s/%s", 2023, rownames(df), sapply(strsplit(df$`Minimum Time`, split = ":"), "[[", 1), sapply(strsplit(df$`Minimum Time`, split = ":"), "[[", 2))
+
+dateMinPos = as.POSIXct(strptime(dateMin, "%Y/%b/%d/%H"))
+
+df$`Maximum Time` <- dateMaxPos
+df$`Minimum Time` <- dateMinPos
+
+df[, c(-2, -4)] <- sapply(df[, c(-2, -4)], as.numeric)
+df
+```
+We can verify the data with some simple plots. These are consistent with what we would believe. Temperatures are highest in the summer months and lowest in the winter months.
+```{r}
+ggplot(df) %>% +
+  geom_point(aes(x = 1:nrow(df), y = df$`Daily Avg`))
+ggplot(df) %>% +
+  geom_point(aes(x = 1:nrow(df), y = df$`DayTime Max`))
+```
+
+#Hourly:
+Lastly, for the hourly data, we have the same process to begin with. Find the start of the tables with the exact titles, then find the end with the same for loop. Verified in the same manner, I manually checked that the ending of the tables was correct.
+```{r}
+hourStart = c(grep("Average Hourly Statistics for Dry Bulb temperatures", ll, useBytes = T),
+              grep("Average Hourly Statistics for Dew Point temperatures", ll, useBytes = T), 
+              grep("Average Hourly Relative Humidity", ll, useBytes = T), 
+              grep("Average Hourly Statistics for Direct Normal Solar Radiation", ll, useBytes = T),
+              grep("Average Hourly Statistics for Wind Speed", ll, useBytes = T))
+hourStart
+statName = ll[hourStart]
+statName = str_replace_all(statName, c(" - Average Hourly Statistics for" = "", " - Average Hourly" = ""))
+```
+
+```{r}
+hourEnd = c()
+for (i in 1 : length(hourStart)) {
+  hourEnd = c(hourEnd, min(grep("- Monthly|- Average|- Maximum", ll, useBytes = T)[grep("- Monthly|- Average|- Maximum", ll, useBytes = T) > hourStart[i]]))
+  print(hourEnd) 
+}
+```
+
+Here we read in the data the same way too. It is separated by tabs at the beginning and end, so we use the same method to remove the empty columns.
+```{r}
+hourlyTables = ll[(hourStart[3] + 1): (hourEnd[3] - 1)]
+hourlyTables = hourlyTables[hourlyTables != ""]
+df2 = read.table(textConnection(hourlyTables), header = T, sep = "\t")
+df2 = remove_empty(df2)
+df2
+df2 = df2[-25:-26, ]
+df2
+```
+
+We use pivot_longer in the tidyr package to mutate the data into the form that we want. However, we run into a problem where the data is combined such that all the like hours are grouped, but this results in our data not being in chronological order, which is what we would likely desire. The way I solved this was by setting the months to be factor levels and ordering them based on factor level. This will descend the data starting with Jan, Feb, etc. We then overwrite the time column to be 0:23 instead of the time intervals in order to verify data easier. The data is verified at the end in the plots where all the tables are combined.
+```{r}
+df2$X.1 <- 0:23
+df3 = df2
+df3 <- df3 %>% 
+  mutate_all(as.numeric) %>%
+  pivot_longer(cols = !X.1)
+
+df3$name <- factor(df3$name, levels = c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"))
+df3 = df3[order(as.factor(df3$name)), ]
+colnames(df3) <- c("Time", "Month", statName[3])
+
+df3
+```
+
+#Functions:
+
+##.wea:
+This is the simplest function. We just input the file name and it reads the lines, skipping the first 6. This is simply the combining of the steps used to read in the .wea file.
+
+
+```{r eval=FALSE, include=TRUE}
+readWea = function(file) {
+  lines = readLines(file)
+  wea = lines[-1:-6]
+  con = textConnection(wea)
+  read.table(con)
+}
+```
+
+##.pvsyst:
+This is also a very simple function that combines the two steps of reading the .pvsyst file. First we save the names of the column, then we read in the data with the column names.
+```{r}
+readPvsyst = function(file) {
+  lines = readLines(file)
+  names = as.vector(strsplit(lines[13], split = ","))
+  data = lines[15:length(lines)]
+  read.table(textConnection(data), sep = ",", col.names = names[[1]])
+}
+
+pv = lapply(p, readPvsyst)
+```
+
+##.stat:
+For the .stat file, I broke it up into the monthly data and the hourly data to avoid having an even more complicated set of functions.
+##Monthly:
+I broke the monthly function into two separate functions. One to read the actual data into the dataframe given the start and ends of the table, and the second one use mapply to read in all the tables at once given the file name.
+
+For the first function, it is the same process that was described above except we now have an if conditional statement that will avoid trying to convert any times if there is not a column called "Maximum" in the original table. This will prevent the wind table from going through the time converting processes, but the other tables will still go through it. Otherwise it is the same and works for all the files.
+```{r}
+readMonthlyBetween = function(lines, monthStart, monthEnd) {
+  monthlyTables = lines[(monthStart + 1): (monthEnd - 1)]
+  monthlyTables = monthlyTables[monthlyTables != ""]
+  
+  df = read.table(textConnection(monthlyTables), header = T, sep = "\t")
+  df = remove_empty(df)
+  
+  df = as.data.frame(t(df))
+  colnames(df) <- as.character(df[1, ])
+  df = df[-1, ]
+  if (sum(((as.vector(colnames(df))) == "Maximum ")) >= 1 ){
+      names(df)[2] <- "Maximum Time"
+      names(df)[4] <- "Minimum Time"
+      dateMax = sprintf("%s/%s/%s/%s", 2023, rownames(df), sapply(strsplit(df$`Maximum Time`, split = ":"), "[[", 1), sapply(strsplit(df$`Maximum Time`, split = ":"), "[[", 2))
+  
+      dateMaxPos = as.POSIXct(strptime(dateMax, "%Y/%b/%d/%H"))
+  
+      dateMin = sprintf("%s/%s/%s/%s", 2023, rownames(df), sapply(strsplit(df$`Minimum Time`, split = ":"), "[[", 1), sapply(strsplit(df$`Minimum Time`, split = ":"), "[[", 2))
+  
+      dateMinPos = as.POSIXct(strptime(dateMin, "%Y/%b/%d/%H"))
+  
+      df$`Maximum Time` <- dateMaxPos
+      df$`Minimum Time` <- dateMinPos
+  
+      df[, c(-2, -4)] <- sapply(df[, c(-2, -4)], as.numeric)
+  }
+  else {
+    df <- as.data.frame(sapply(df, as.numeric))
+  }
+  df
+}
+
+readStatMonthly = function(file) {
+  lines = readLines(file)
+  monthStart = c(grep("Monthly Statistics for Dry Bulb temperatures", lines, useBytes = T),
+                 grep("Monthly Statistics for Dew Point temperatures", lines, useBytes = T), 
+                 grep("Monthly Wind Direction", lines, useBytes = T), 
+                 grep("Monthly Statistics for Wind Speed", lines, useBytes = T))
+  monthEnd = c()
+  for (i in 1 : length(monthStart)) {
+    monthEnd = c(monthEnd, min(grep("- Monthly|- Average|- Maximum", lines, useBytes = T)[grep("- Monthly|- Average|- Maximum", lines, useBytes = T) > monthStart[i]]))
+  }
+  mapply(readMonthlyBetween, monthStart, monthEnd, MoreArgs = list(lines = lines))
+}
+
+w = readStatMonthly("USA_CA_Fairfield-San.Francisco.Bay.Reserve.998011_TMYx.2007-2021.stat")
+
+w = readMonthlyBetween(ll, monthStart = monthStart, monthEnd = monthEnd)
+```
+
+##Hourly:
+For the hourly data, it is split into two functions as well, doing similar things in each. The first function reads in all the tables given the start and ending point as well as the name of the stat so we can name the column. This is necessary so that in the second function, we can correctly name the column of the stat when we place all the data into one dataframe. This process is verified by the graphs at the end.
+```{r}
+readHourlyBetween = function(lines, hourStart, hourEnd, statName){
+  
+  hourlyTables = lines[(hourStart + 1): (hourEnd - 1)]
+  hourlyTables = hourlyTables[hourlyTables != ""]
+  hourlyDF = read.table(textConnection(hourlyTables), header = T, sep = "\t")
+  hourlyDF = remove_empty(hourlyDF)
+  hourlyDF = hourlyDF[-25:-26, ]
+  
+  hourlyDF$X.1 <- 0:23
+  hourlyDF2 = hourlyDF
+  hourlyDF2 <- hourlyDF2 %>% 
+    mutate_all(as.numeric) %>%
+    pivot_longer(cols = !X.1)
+  
+  hourlyDF2$name <- factor(hourlyDF2$name, levels = c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"))
+  hourlyDF2 = hourlyDF2[order(as.factor(hourlyDF2$name)), ]
+  colnames(hourlyDF2) <- c("Time", "Month", statName)
+  
+  hourlyDF2
+}
+
+readStatHourly = function(file) {
+  lines = readLines(file)
+  hourStart = c(grep("Average Hourly Statistics for Dry Bulb temperatures", lines, useBytes = T),
+                grep("Average Hourly Statistics for Dew Point temperatures", lines, useBytes = T), 
+                grep("Average Hourly Relative Humidity", lines, useBytes = T), 
+                grep("Average Hourly Statistics for Direct Normal Solar Radiation", lines, useBytes = T),
+                grep("Average Hourly Statistics for Wind Speed", lines, useBytes = T))
+  
+  hourEnd = c()
+  for (i in 1 : length(hourStart)) {
+    hourEnd = c(hourEnd, min(grep("- Monthly|- Average|- Maximum", lines, useBytes = T)[grep("- Monthly|- Average|- Maximum", lines, useBytes = T) > hourStart[i]]))
+  }
+  
+  statName = lines[hourStart]
+  statName = str_replace_all(statName, c(" - Average Hourly Statistics for" = "", " - Average Hourly" = ""))
+  
+  list = mapply(readHourlyBetween, hourStart, hourEnd, statName, MoreArgs = list(lines = lines))
+  
+  totalHourly = data.frame(list[1, 1])
+  totalHourly$Month = list[2, 1]$Month
+  for (i in 1:length(statName)) {
+    totalHourly[i+2] = list[3, i]
+  }
+  
+  colnames(totalHourly) = c("Time", "Month", statName[1:length(statName)])
+  totalHourly
+}
+
+w = readStatHourly("USA_CA_Fairfield-San.Francisco.Bay.Reserve.998011_TMYx.2007-2021.stat")
+
+```
+
+#Plots
+Here we plot all the statistics against time and colored by month. All follow what we would intuitively assume about there respective statistics, giving us some verification of the data.
+```{r}
+w %>% ggplot() + 
+  geom_point(aes(y = w$` Dry Bulb temperatures [C]`, x = w$Time, color = Month))
+w %>% ggplot() +
+  geom_point(aes(y = w$` Dew Point temperatures [C]`, x = w$Time, color = Month))
+w %>% ggplot() +
+  geom_point(aes(y = w$` Relative Humidity [%]`, x = w$Time, color = Month))
+w %>% ggplot() +
+  geom_point(aes(y = w$` Wind Speed [m/s]`, x = w$Time, color = Month))
+```
+
+
